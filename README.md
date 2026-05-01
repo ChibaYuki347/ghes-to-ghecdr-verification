@@ -199,8 +199,8 @@ GHE.com にアクセスできれば、**閉域構成 + tinyproxy 経由 + NAT Ga
 | 用途 | コマンド |
 |---|---|
 | GHES 管理コンソールへの tunnel | `./scripts/03-tunnel-ghes-mgmt.sh` |
-| GHES admin shell (port 122) | `./scripts/03-tunnel-ghes-mgmt.sh --admin-shell` (内部で `MODE=ssh` + `SSH_RESOURCE_PORT=122`) |
-| Proxy VM SSH | `az network bastion ssh --resource-group rg-ghestest-jpe --name <bastion> --target-resource-id <proxy_vm_id> --auth-type ssh-key --username ghadmin --ssh-key ~/.ssh/ghestest_id_ed25519` |
+| GHES admin shell (port 122) | `./scripts/03-tunnel-ghes-mgmt.sh --admin-shell` (リモート 122 → ローカル 2222 にバインド。SSH は `ssh -p 2222 admin@localhost`) |
+| Proxy VM SSH | `az network bastion ssh --resource-group "${RG_NAME:-rg-ghestest-jpe}" --name <bastion> --target-resource-id <proxy_vm_id> --auth-type ssh-key --username ghadmin --ssh-key "${SSH_PRIVATE_KEY_PATH:-~/.ssh/ghestest_id_ed25519}"` |
 | GHES VM extension 確認 (空であるべき) | `az vm extension list -g rg-ghestest-jpe --vm-name vm-ghestest-ghes -o table` |
 | デプロイ済み outputs 取得 | `az deployment sub list --query "[?name.starts_with(@,'ghestest-')] \| [0].properties.outputs"` |
 

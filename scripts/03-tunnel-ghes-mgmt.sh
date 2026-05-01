@@ -115,12 +115,16 @@ case "${MODE}" in
   ssh)
     if [[ "${admin_shell_requested}" == true ]]; then
       RESOURCE_PORT="${SSH_RESOURCE_PORT:-122}"
+      # GHES admin shell is at remote port 122. Use 2222 locally to avoid
+      # needing root for binding to a privileged port (< 1024).
+      LOCAL_PORT="${LOCAL_PORT:-2222}"
     else
       RESOURCE_PORT="${SSH_RESOURCE_PORT:-${RESOURCE_PORT:-22}}"
+      # Default to a non-privileged local port (2200) to avoid root requirement.
+      LOCAL_PORT="${LOCAL_PORT:-2200}"
     fi
-    LOCAL_PORT="${LOCAL_PORT:-${RESOURCE_PORT}}"
     echo "Opening Bastion tunnel: localhost:${LOCAL_PORT} -> ${GHES_VM_ID}:${RESOURCE_PORT} (SSH)"
-    echo "In another terminal, connect to localhost:${LOCAL_PORT} with SSH."
+    echo "In another terminal, connect with: ssh -p ${LOCAL_PORT} <username>@localhost"
     ;;
   *)
     echo "[ERROR] Unsupported MODE '${MODE}'. Use MODE=mgmt or MODE=ssh." >&2
