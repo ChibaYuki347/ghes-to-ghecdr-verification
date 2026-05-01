@@ -1,0 +1,39 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+packages:
+  - tinyproxy
+  - net-tools
+  - dnsutils
+
+write_files:
+  - path: /etc/tinyproxy/tinyproxy.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      User tinyproxy
+      Group tinyproxy
+      Port 8888
+      Listen 0.0.0.0
+      Timeout 600
+      DefaultErrorFile "/usr/share/tinyproxy/default.html"
+      StatFile "/usr/share/tinyproxy/stats.html"
+      LogFile "/var/log/tinyproxy/tinyproxy.log"
+      LogLevel Info
+      PidFile "/run/tinyproxy/tinyproxy.pid"
+      MaxClients 100
+      Allow 127.0.0.1
+      Allow 10.0.0.0/8
+      ViaProxyName "ghestest-proxy"
+      DisableViaHeader Yes
+      ConnectPort 443
+      ConnectPort 563
+      ConnectPort 22
+
+runcmd:
+  - sed -i 's|^# *DefaultErrorFile.*|DefaultErrorFile "/usr/share/tinyproxy/default.html"|' /etc/tinyproxy/tinyproxy.conf || true
+  - mkdir -p /run/tinyproxy && chown tinyproxy:tinyproxy /run/tinyproxy
+  - systemctl enable tinyproxy
+  - systemctl restart tinyproxy
+  - ufw disable || true
+  - echo "tinyproxy bootstrap finished at $(date -u)" >> /var/log/cloud-init-output.log
