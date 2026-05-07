@@ -20,16 +20,22 @@ fi
 
 usage() {
   cat <<EOF
-Usage: $0 [--ssh] [--admin-shell]
+Usage: $0 [--ssh] [--admin-shell] [--web]
+
+Modes:
+  (default)        Management Console: GHES :8443 -> localhost:8443
+  --web            Web UI / Git HTTPS: GHES :443  -> localhost:8444
+  --ssh            Git SSH:            GHES :22   -> localhost:2200
+  --admin-shell    GHES admin shell:   GHES :122  -> localhost:2222
 
 Environment overrides:
   SUBSCRIPTION_ID       Azure subscription ID (default: ${SUBSCRIPTION_ID})
   RG_NAME               Resource group name (default: ${RG_NAME})
   GHES_VM_ID            GHES VM resource ID
   BASTION_NAME          Azure Bastion name
-  MODE                  mgmt or ssh (default: ${MODE})
+  MODE                  mgmt | web | ssh (default: ${MODE})
   LOCAL_PORT            Local tunnel port
-  SSH_RESOURCE_PORT     SSH resource port; use 122 for GHES admin shell
+  RESOURCE_PORT         Remote port on the GHES VM
 EOF
 }
 
@@ -42,6 +48,9 @@ for arg in "$@"; do
     --admin-shell|--admin)
       MODE="ssh"
       admin_shell_requested=true
+      ;;
+    --web|--https)
+      MODE="web"
       ;;
     -h|--help)
       usage
@@ -112,6 +121,14 @@ case "${MODE}" in
     echo "Opening Bastion tunnel: localhost:${LOCAL_PORT} -> ${GHES_VM_ID}:${RESOURCE_PORT} (Management Console)"
     echo "In another terminal, browse: https://localhost:${LOCAL_PORT}"
     ;;
+  web|https)
+    RESOURCE_PORT="${RESOURCE_PORT:-443}"
+    # Use 8444 locally to avoid binding to a privileged port (< 1024).
+    LOCAL_PORT="${LOCAL_PORT:-8444}"
+    echo "Opening Bastion tunnel: localhost:${LOCAL_PORT} -> ${GHES_VM_ID}:${RESOURCE_PORT} (Web UI / Git HTTPS)"
+    echo "In another terminal, browse: https://<your-ghes-hostname>:${LOCAL_PORT}"
+    echo "Make sure the hostname resolves to 127.0.0.1 in your client's hosts file."
+    ;;
   ssh)
     if [[ "${admin_shell_requested}" == true ]]; then
       RESOURCE_PORT="${SSH_RESOURCE_PORT:-122}"
@@ -127,7 +144,7 @@ case "${MODE}" in
     echo "In another terminal, connect with: ssh -p ${LOCAL_PORT} <username>@localhost"
     ;;
   *)
-    echo "[ERROR] Unsupported MODE '${MODE}'. Use MODE=mgmt or MODE=ssh." >&2
+    echo "[ERROR] Unsupported MODE '${MODE}'. Use MODE=mgmt | web | ssh." >&2
     exit 2
     ;;
 esac

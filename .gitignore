@@ -16,6 +16,10 @@ logs/*
 *_id_rsa
 *_id_rsa.pub
 
+# Generated TLS certs (self-signed for lab; private keys must never be committed)
+certs/*
+!certs/.gitkeep
+
 # Bicep build artifacts
 *.bicep.json
 

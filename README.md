@@ -158,11 +158,71 @@ Management Console 画面で以下を設定します。
 
 1. **License upload**: `.ghl` ファイルをアップロード
 2. **Management Console password**: 任意の強い password を設定
-3. **Hostname**: 初期値 `localhost` のままで OK
-   - 後で `ghes.ghestest.internal` に変更可能です。
+3. **Hostname / TLS / Subdomain Isolation**: 後述の **3.1** で設定
 4. 設定保存
 5. 自動再起動を待機
-   - 目安: 約 5 分
+   - 目安: 約 5 〜 15 分
+
+#### 3.1. 公開スタイル Hostname と TLS 証明書を設定する
+
+GHES の `Hostname` 検証は VM 自身からの DNS 解決と loopback HTTPS 接続を要求します。閉域構成のまま公開スタイル FQDN（例: `ghes-lab.chiba-yuki.com`）を使う場合、Azure Private DNS Zone を VNet にリンクして VM 内部から名前解決できるようにします。クライアント側ブラウザは `hosts` ファイルで loopback マッピングします。
+
+**Step A: Private DNS Zone と A レコードを作成**
+
+```bash
+# 既定: zone=chiba-yuki.com, label=ghes-lab, wildcard 含む
+./scripts/05-setup-public-dns.sh
+
+# カスタマイズ例:
+ZONE=example.com LABEL=ghes INCLUDE_WILDCARD=false ./scripts/05-setup-public-dns.sh
+```
+
+スクリプトは idempotent です。zone / VNet link / A record (apex + wildcard) を upsert します。
+
+**Step B: 自己署名 wildcard 証明書を生成（PoC / 検証目的）**
+
+```bash
+./scripts/04-generate-self-signed-cert.sh ghes-lab.chiba-yuki.com
+# 出力: certs/ghes-lab.chiba-yuki.com.{crt,key}
+```
+
+本番運用では Let's Encrypt (DNS-01) や内部 CA で発行した正規証明書を使用してください。
+
+**Step C: クライアント側ブラウザの名前解決**
+
+WSL から Windows hosts file を管理者権限で編集する場合:
+
+```bash
+powershell.exe -Command "Start-Process notepad -ArgumentList 'C:\Windows\System32\drivers\etc\hosts' -Verb RunAs"
+```
+
+末尾に以下を追加して保存:
+
+```
+127.0.0.1 ghes-lab.chiba-yuki.com
+```
+
+**Step D: GHES Management Console で適用**
+
+ブラウザの setup wizard / Management Console で:
+
+| 項目 | 値（PoC） | 値（フル本番） |
+|---|---|---|
+| Hostname | `ghes-lab.chiba-yuki.com` | `ghes.<your-domain>` |
+| TLS certificate | `certs/ghes-lab.chiba-yuki.com.crt` | wildcard SAN cert (CA-issued) |
+| TLS key | `certs/ghes-lab.chiba-yuki.com.key` | 対応する private key |
+| Subdomain isolation | OFF | **ON** (推奨) |
+| Test domain settings | ✓ | ✓ |
+| Save settings | クリック → reconfigure run 完了まで待機 | 同左 |
+
+**Step E: Web UI へのアクセス用 tunnel を起動**
+
+GHES の web UI は port 443 で待ち受けます。Bastion tunnel の `--web` モードで localhost:8444 にフォワードします。
+
+```bash
+./scripts/03-tunnel-ghes-mgmt.sh --web
+# → ブラウザで https://ghes-lab.chiba-yuki.com:8444/
+```
 
 ### 4. 再起動後にサインイン確認
 
@@ -199,7 +259,10 @@ GHE.com にアクセスできれば、**閉域構成 + tinyproxy 経由 + NAT Ga
 | 用途 | コマンド |
 |---|---|
 | GHES 管理コンソールへの tunnel | `./scripts/03-tunnel-ghes-mgmt.sh` |
+| GHES Web UI 用 tunnel (port 443 → 8444) | `./scripts/03-tunnel-ghes-mgmt.sh --web` |
 | GHES admin shell (port 122) | `./scripts/03-tunnel-ghes-mgmt.sh --admin-shell` (リモート 122 → ローカル 2222 にバインド。SSH は `ssh -p 2222 admin@localhost`) |
+| 自己署名 wildcard 証明書生成 | `./scripts/04-generate-self-signed-cert.sh <fqdn>` |
+| 公開スタイル Hostname の Private DNS 設定 | `./scripts/05-setup-public-dns.sh` (`ZONE=` / `LABEL=` で上書き可) |
 | Proxy VM SSH | `az network bastion ssh --resource-group "${RG_NAME:-rg-ghestest-jpe}" --name <bastion> --target-resource-id <proxy_vm_id> --auth-type ssh-key --username ghadmin --ssh-key "${SSH_PRIVATE_KEY_PATH:-~/.ssh/ghestest_id_ed25519}"` |
 | GHES VM extension 確認 (空であるべき) | `az vm extension list -g rg-ghestest-jpe --vm-name vm-ghestest-ghes -o table` |
 | デプロイ済み outputs 取得 | `az deployment sub list --query "[?name.starts_with(@,'ghestest-')] \| [0].properties.outputs"` |
@@ -269,7 +332,9 @@ ghes-to-ghecdr/
 ├── scripts/
 │   ├── 01-generate-ssh-key.sh
 │   ├── 02-deploy.sh
-│   └── 03-tunnel-ghes-mgmt.sh
+│   ├── 03-tunnel-ghes-mgmt.sh
+│   ├── 04-generate-self-signed-cert.sh
+│   └── 05-setup-public-dns.sh
 ├── docs/
 │   └── defender-precheck.md
 └── .github/agents/                 # awesome-copilot Custom Agents (Bicep 実装/計画レビュー用)
