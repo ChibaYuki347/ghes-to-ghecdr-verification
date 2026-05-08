@@ -18,6 +18,27 @@ if [[ -z "${SUBSCRIPTION_ID}" ]]; then
   exit 1
 fi
 
+# --- WSL + Microsoft Entra Global Secure Access (GSA) loopback fix ---------
+# When the GSA Windows client is running, it installs a 'loopback0' interface
+# inside WSL2 and a high-priority routing rule (priority 1) that hijacks ALL
+# loopback (127.0.0.0/8) traffic, making `connect_ex(127.0.0.1, port)` hang
+# in SYN-SENT instead of returning ECONNREFUSED. The Bastion CLI's
+# `is_port_open()` pre-check then never returns and the tunnel never binds.
+# We add a higher-priority rule (priority 0) that keeps purely-local loopback
+# traffic on the kernel's local table, bypassing the GSA hijack.
+# See README troubleshooting section for details.
+if ip link show loopback0 >/dev/null 2>&1; then
+  if ! ip rule show | grep -qE "^0:[[:space:]]+from 127\.0\.0\.0/8 to 127\.0\.0\.0/8 lookup local"; then
+    echo "[INFO] Detected Microsoft Entra Global Secure Access loopback0; adding bypass rule (sudo)..."
+    if ! sudo -n ip rule add from 127.0.0.0/8 to 127.0.0.0/8 lookup local priority 0 2>/dev/null; then
+      echo "[INFO] sudo password required to install loopback bypass rule:"
+      sudo ip rule add from 127.0.0.0/8 to 127.0.0.0/8 lookup local priority 0
+    fi
+    echo "[INFO] Loopback bypass rule installed."
+  fi
+fi
+# ---------------------------------------------------------------------------
+
 usage() {
   cat <<EOF
 Usage: $0 [--ssh] [--admin-shell] [--web]

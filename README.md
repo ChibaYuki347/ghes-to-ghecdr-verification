@@ -314,6 +314,8 @@ az group delete -n "${RG_NAME}" --yes --no-wait
 | `https://localhost:8443` が応答なし | Bastion tunnel が確立しているか確認します。別端末から `curl -k https://localhost:8443` を実行してください。ポート競合の場合は `--port 18443` 等に変更します。 |
 | GitHub Connect が GHE.com に到達できない | Proxy VM の tinyproxy が動作しているか確認します: `sudo systemctl status tinyproxy` (Bastion 経由 SSH で実行)。 |
 | `installing-github-enterprise-server-on-azure` 公式手順との差分 | 公式手順は Public IP 前提・パスワードログイン前提です。本リポジトリは閉域 + 鍵認証に振っています。 |
+| WSL から `az` ログインしても `Bastion tunnel` が `8443` で listen しない / SYN-SENT のまま固まる | **Microsoft Entra Global Secure Access (GSA) Windows クライアント** が WSL2 内に `loopback0` 仮想 IF と routing rule (`priority 1: ipproto tcp lookup 127`) を追加し、127.0.0.1 ループバック全てを intercept しています。`03-tunnel-ghes-mgmt.sh` は起動時に自動で priority 0 の bypass rule (`from 127.0.0.0/8 to 127.0.0.0/8 lookup local`) を追加します（sudo が必要）。手動で適用する場合: `sudo ip rule add from 127.0.0.0/8 to 127.0.0.0/8 lookup local priority 0` |
+| `az login` 後に `Failed to resolve 'login.microsoftonline.com'` | 同じく GSA がパブリック MS auth エンドポイントを `6.6.0.x` private link に書き換えています。`/etc/hosts` で `40.126.32.74 login.microsoftonline.com login.windows.net sts.windows.net` 等を強制マッピングしてください。 |
 
 ## 11. 関連ファイル
 
