@@ -30,7 +30,8 @@ param(
     [int]$LocalPort,
     [int]$ResourcePort,
     [switch]$AutoStart,
-    [switch]$SkipPreflight
+    [switch]$SkipPreflight,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -150,6 +151,57 @@ switch ($Mode) {
         Write-Host "Connect with: ssh -i ~/.ssh/<your-key> -p $LocalPort admin@localhost"
     }
 }
+
+# --- Preflight 2: ensure LocalPort is free (or kill stale Bastion tunnel) ---
+# Bastion CLI errors with "Defined port is currently unavailable" when the
+# port is taken, but does not say which process holds it. A stale tunnel
+# (forgotten previous run, VPN switch, PC sleep) is the most common cause.
+$existingConn = Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($existingConn) {
+    $existingPid = $existingConn.OwningProcess
+    $existingProc = Get-Process -Id $existingPid -ErrorAction SilentlyContinue
+    $procName = if ($existingProc) { $existingProc.ProcessName } else { 'unknown' }
+
+    # Best-effort fetch of the command line via WMI/CIM
+    $cmdLine = ''
+    try {
+        $cimProc = Get-CimInstance Win32_Process -Filter "ProcessId=$existingPid" -ErrorAction SilentlyContinue
+        if ($cimProc) { $cmdLine = $cimProc.CommandLine }
+    } catch {}
+
+    Write-Host "[preflight] Local port $LocalPort is held by PID $existingPid ($procName)"
+    if ($cmdLine) { Write-Host "[preflight]   cmd: $cmdLine" }
+
+    $isBastion = $false
+    if ($cmdLine -match 'bastion' -or $cmdLine -match 'az network') {
+        $isBastion = $true
+    } elseif ($procName -match '^(python|python3|az)$') {
+        # Bastion CLI worker is python.exe / az.exe; treat as probable Bastion.
+        $isBastion = $true
+    }
+
+    if ($isBastion) {
+        if ($Force) {
+            Write-Host "[preflight] -Force -> stopping stale Bastion tunnel PID $existingPid..." -ForegroundColor Yellow
+            Stop-Process -Id $existingPid -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            $still = Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue
+            if ($still) {
+                Write-Error "[preflight] Could not free port $LocalPort. Kill PID $existingPid manually."
+                exit 4
+            }
+            Write-Host "[preflight] Port $LocalPort is free."
+        } else {
+            Write-Error "[preflight] Detected stale Bastion tunnel on port $LocalPort.`nRe-run with -Force to terminate it, or:`n  Stop-Process -Id $existingPid -Force"
+            exit 4
+        }
+    } else {
+        Write-Error "[preflight] Port $LocalPort is held by a non-Bastion process ($procName). Refusing to kill. Use a different -LocalPort or stop that process manually."
+        exit 4
+    }
+}
+# ---------------------------------------------------------------------------
 
 Write-Host "Press Ctrl+C to close the tunnel."
 Write-Host ''

@@ -41,7 +41,7 @@ fi
 
 usage() {
   cat <<EOF
-Usage: $0 [--ssh] [--admin-shell] [--web] [--auto-start] [--skip-preflight]
+Usage: $0 [--ssh] [--admin-shell] [--web] [--auto-start] [--skip-preflight] [--force]
 
 Modes:
   (default)        Management Console: GHES :8443 -> localhost:8443
@@ -55,6 +55,11 @@ Preflight options:
                    Equivalent to AUTO_START=true.
   --skip-preflight Skip VM power-state check entirely.
                    Equivalent to SKIP_PREFLIGHT=true.
+  --force          If LOCAL_PORT is held by a stale Bastion tunnel
+                   (python3 / az network bastion tunnel), terminate it
+                   automatically. Without this flag, the script reports
+                   the stale process and exits.
+                   Equivalent to FORCE_KILL=true.
 
 Environment overrides:
   SUBSCRIPTION_ID       Azure subscription ID (default: ${SUBSCRIPTION_ID})
@@ -66,6 +71,7 @@ Environment overrides:
   RESOURCE_PORT         Remote port on the GHES VM
   AUTO_START            true  -> auto start VM if deallocated
   SKIP_PREFLIGHT        true  -> skip VM state check
+  FORCE_KILL            true  -> auto-kill stale Bastion tunnel on LOCAL_PORT
 EOF
 }
 
@@ -87,6 +93,9 @@ for arg in "$@"; do
       ;;
     --skip-preflight)
       SKIP_PREFLIGHT=true
+      ;;
+    --force|-f)
+      FORCE_KILL=true
       ;;
     -h|--help)
       usage
@@ -248,6 +257,68 @@ case "${MODE}" in
     exit 2
     ;;
 esac
+
+# --- Preflight 2: ensure LOCAL_PORT is free (or kill stale Bastion tunnel) -
+# Bastion CLI errors with "Defined port is currently unavailable" when the
+# port is taken, but does not tell you which process holds it. A stale
+# tunnel (forgotten previous run, VPN switch, PC sleep) is by far the most
+# common cause, so detect it explicitly.
+FORCE_KILL="${FORCE_KILL:-false}"
+existing_pid="$(ss -tnlp "sport = :${LOCAL_PORT}" 2>/dev/null \
+  | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | head -1)"
+if [[ -n "${existing_pid}" ]]; then
+  proc_name="$(ps -p "${existing_pid}" -o comm= 2>/dev/null | tr -d ' ' || echo unknown)"
+  proc_args="$(ps -p "${existing_pid}" -o args= 2>/dev/null || echo '')"
+  parent_pid="$(ps -p "${existing_pid}" -o ppid= 2>/dev/null | tr -d ' ' || echo '')"
+  parent_args=""
+  if [[ -n "${parent_pid}" && "${parent_pid}" != "1" ]]; then
+    parent_args="$(ps -p "${parent_pid}" -o args= 2>/dev/null || echo '')"
+  fi
+  echo "[preflight] Local port ${LOCAL_PORT} is held by PID ${existing_pid} (${proc_name})"
+
+  is_bastion=false
+  if [[ "${proc_args}" == *bastion* || "${proc_args}" == *"az network"* \
+        || "${parent_args}" == *bastion* || "${parent_args}" == *"az network"* ]]; then
+    is_bastion=true
+  elif [[ "${proc_name}" == python* ]]; then
+    # Bastion CLI launches a python3 worker that often has bare 'python3' as args.
+    # Treat python listeners as probable Bastion tunnels (best-effort heuristic).
+    is_bastion=true
+  fi
+
+  if [[ "${is_bastion}" == true ]]; then
+    if [[ "${FORCE_KILL}" == "true" ]]; then
+      echo "[preflight] --force/FORCE_KILL=true → terminating stale Bastion tunnel PID ${existing_pid}..."
+      kill "${existing_pid}" 2>/dev/null || sudo -n kill "${existing_pid}" 2>/dev/null || true
+      for i in 1 2 3 4 5; do
+        sleep 1
+        if ! ss -tnl "sport = :${LOCAL_PORT}" 2>/dev/null | grep -q LISTEN; then
+          break
+        fi
+      done
+      if ss -tnl "sport = :${LOCAL_PORT}" 2>/dev/null | grep -q LISTEN; then
+        echo "[preflight] Sending SIGKILL..."
+        kill -9 "${existing_pid}" 2>/dev/null || sudo -n kill -9 "${existing_pid}" 2>/dev/null || true
+        sleep 2
+      fi
+      if ss -tnl "sport = :${LOCAL_PORT}" 2>/dev/null | grep -q LISTEN; then
+        echo "[preflight][ERROR] Could not free port ${LOCAL_PORT}. Kill PID ${existing_pid} manually." >&2
+        exit 4
+      fi
+      echo "[preflight] Port ${LOCAL_PORT} is free."
+    else
+      echo "[preflight][ERROR] Detected stale Bastion tunnel on port ${LOCAL_PORT}." >&2
+      echo "[preflight] Re-run with --force (or FORCE_KILL=true) to terminate it, or:" >&2
+      echo "             kill ${existing_pid}" >&2
+      exit 4
+    fi
+  else
+    echo "[preflight][ERROR] Port ${LOCAL_PORT} is held by a non-Bastion process (${proc_name})." >&2
+    echo "[preflight] Use a different LOCAL_PORT, or stop that process manually." >&2
+    exit 4
+  fi
+fi
+# --------------------------------------------------------------------------
 
 echo "Press Ctrl+C to close the tunnel."
 az network bastion tunnel \
