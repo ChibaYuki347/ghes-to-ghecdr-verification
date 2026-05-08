@@ -41,13 +41,20 @@ fi
 
 usage() {
   cat <<EOF
-Usage: $0 [--ssh] [--admin-shell] [--web]
+Usage: $0 [--ssh] [--admin-shell] [--web] [--auto-start] [--skip-preflight]
 
 Modes:
   (default)        Management Console: GHES :8443 -> localhost:8443
   --web            Web UI / Git HTTPS: GHES :443  -> localhost:8444
   --ssh            Git SSH:            GHES :22   -> localhost:2200
   --admin-shell    GHES admin shell:   GHES :122  -> localhost:2222
+
+Preflight options:
+  --auto-start     If GHES VM is deallocated/stopped, start it and wait
+                   for it to be running + GHES warmup (~5 min total).
+                   Equivalent to AUTO_START=true.
+  --skip-preflight Skip VM power-state check entirely.
+                   Equivalent to SKIP_PREFLIGHT=true.
 
 Environment overrides:
   SUBSCRIPTION_ID       Azure subscription ID (default: ${SUBSCRIPTION_ID})
@@ -57,6 +64,8 @@ Environment overrides:
   MODE                  mgmt | web | ssh (default: ${MODE})
   LOCAL_PORT            Local tunnel port
   RESOURCE_PORT         Remote port on the GHES VM
+  AUTO_START            true  -> auto start VM if deallocated
+  SKIP_PREFLIGHT        true  -> skip VM state check
 EOF
 }
 
@@ -72,6 +81,12 @@ for arg in "$@"; do
       ;;
     --web|--https)
       MODE="web"
+      ;;
+    --auto-start)
+      AUTO_START=true
+      ;;
+    --skip-preflight)
+      SKIP_PREFLIGHT=true
       ;;
     -h|--help)
       usage
@@ -134,6 +149,70 @@ if [[ -z "${BASTION_NAME:-}" || "${BASTION_NAME}" == "None" ]]; then
   echo "[ERROR] Could not determine Bastion name. Set BASTION_NAME or deploy first." >&2
   exit 1
 fi
+
+# --- Preflight: verify VM is running before opening tunnel ----------------
+# Skipping this and going straight to `az network bastion tunnel` against a
+# deallocated VM yields a vague timeout; users misdiagnose it as a tunnel
+# bug. Detect explicitly and offer to start the VM.
+SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
+AUTO_START="${AUTO_START:-false}"
+if [[ "${SKIP_PREFLIGHT}" != "true" ]]; then
+  echo "[preflight] Checking GHES VM power state..."
+  power_state="$(az vm get-instance-view --ids "${GHES_VM_ID}" \
+    --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" \
+    -o tsv 2>/dev/null || true)"
+  power_state="${power_state#PowerState/}"
+  echo "[preflight] GHES VM power state: ${power_state:-unknown}"
+
+  case "${power_state}" in
+    running)
+      ;;
+    deallocated|stopped|"stopped (deallocated)"|"deallocating"|"")
+      if [[ "${AUTO_START}" == "true" ]]; then
+        echo "[preflight] AUTO_START=true → starting GHES VM..."
+        az vm start --ids "${GHES_VM_ID}" --no-wait
+        echo "[preflight] Waiting for VM to reach running state..."
+        for i in $(seq 1 30); do
+          sleep 10
+          ps="$(az vm get-instance-view --ids "${GHES_VM_ID}" \
+            --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" \
+            -o tsv 2>/dev/null || true)"
+          ps="${ps#PowerState/}"
+          echo "[preflight]   ${i}/30  state=${ps}"
+          if [[ "${ps}" == "running" ]]; then
+            echo "[preflight] VM is now running. Allowing 90s for GHES service warmup..."
+            sleep 90
+            break
+          fi
+        done
+      else
+        echo "[preflight][ERROR] GHES VM is not running (state=${power_state:-unknown})." >&2
+        echo "[preflight] Run with AUTO_START=true to start it automatically, or:" >&2
+        echo "             az vm start --ids '${GHES_VM_ID}'" >&2
+        exit 3
+      fi
+      ;;
+    starting)
+      echo "[preflight] VM is starting; waiting up to 5 min for it to become running..."
+      for i in $(seq 1 30); do
+        sleep 10
+        ps="$(az vm get-instance-view --ids "${GHES_VM_ID}" \
+          --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" \
+          -o tsv 2>/dev/null || true)"
+        ps="${ps#PowerState/}"
+        if [[ "${ps}" == "running" ]]; then
+          echo "[preflight] VM running. Waiting 90s for GHES warmup..."
+          sleep 90
+          break
+        fi
+      done
+      ;;
+    *)
+      echo "[preflight][WARN] Unknown VM power state '${power_state}'. Continuing anyway." >&2
+      ;;
+  esac
+fi
+# --------------------------------------------------------------------------
 
 case "${MODE}" in
   mgmt|management|console)

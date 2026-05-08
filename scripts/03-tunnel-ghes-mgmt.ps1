@@ -28,7 +28,9 @@ param(
     [string]$BastionName = 'bas-ghestest',
     [string]$VmName = 'vm-ghestest-ghes',
     [int]$LocalPort,
-    [int]$ResourcePort
+    [int]$ResourcePort,
+    [switch]$AutoStart,
+    [switch]$SkipPreflight
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,6 +65,62 @@ if (-not $vmId) {
     Write-Error "Could not find VM '$VmName' in resource group '$ResourceGroup'"
     exit 1
 }
+
+# --- Preflight: verify VM is running before opening tunnel ----------------
+if (-not $SkipPreflight) {
+    Write-Host '[preflight] Checking GHES VM power state...' -ForegroundColor Cyan
+    $powerState = az vm get-instance-view --ids $vmId `
+        --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" `
+        -o tsv 2>$null
+    $powerState = $powerState -replace '^PowerState/', ''
+    Write-Host "[preflight] GHES VM power state: $powerState"
+
+    switch ($powerState) {
+        'running' { }
+        { $_ -in 'deallocated', 'stopped', 'stopped (deallocated)', 'deallocating', '' } {
+            if ($AutoStart) {
+                Write-Host '[preflight] -AutoStart -> starting GHES VM...' -ForegroundColor Yellow
+                az vm start --ids $vmId --no-wait
+                Write-Host '[preflight] Waiting for VM to reach running state...'
+                for ($i = 1; $i -le 30; $i++) {
+                    Start-Sleep -Seconds 10
+                    $ps = az vm get-instance-view --ids $vmId `
+                        --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" `
+                        -o tsv 2>$null
+                    $ps = $ps -replace '^PowerState/', ''
+                    Write-Host "[preflight]   $i/30  state=$ps"
+                    if ($ps -eq 'running') {
+                        Write-Host '[preflight] VM running. Allowing 90s for GHES service warmup...'
+                        Start-Sleep -Seconds 90
+                        break
+                    }
+                }
+            } else {
+                Write-Error "[preflight] GHES VM is not running (state=$powerState).`nRun with -AutoStart to start it, or:`n  az vm start --ids '$vmId'"
+                exit 3
+            }
+        }
+        'starting' {
+            Write-Host '[preflight] VM is starting; waiting up to 5 min...'
+            for ($i = 1; $i -le 30; $i++) {
+                Start-Sleep -Seconds 10
+                $ps = az vm get-instance-view --ids $vmId `
+                    --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" `
+                    -o tsv 2>$null
+                $ps = $ps -replace '^PowerState/', ''
+                if ($ps -eq 'running') {
+                    Write-Host '[preflight] VM running. Waiting 90s for GHES warmup...'
+                    Start-Sleep -Seconds 90
+                    break
+                }
+            }
+        }
+        default {
+            Write-Warning "[preflight] Unknown VM power state '$powerState'. Continuing anyway."
+        }
+    }
+}
+# --------------------------------------------------------------------------
 
 # Mode -> port mapping
 switch ($Mode) {

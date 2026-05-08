@@ -138,7 +138,7 @@ az deployment sub list --query "[?name.starts_with(@,'ghestest-')] | [0].propert
 
 > ⚠️ **VPN クライアントが Windows で稼働している場合の重要事項**
 >
-> Microsoft Entra Global Secure Access、GlobalProtect、Cisco AnyConnect 等の VPN クライアントが Windows で動作している環境では、WSL2 NAT ネットワークが VPN によって干渉を受け、以下のような症状が発生します（Microsoft 内部ガイド `Global Secure Access` でも Known Issue として明記）:
+> Microsoft Entra Global Secure Access、GlobalProtect、Cisco AnyConnect 等の VPN クライアントが Windows で動作している環境では、WSL2 NAT ネットワークが VPN によって干渉を受け、以下のような症状が発生します（Microsoft ガイド `Global Secure Access` でも Known Issue として明記）:
 > - WSL から `az login` / `az network bastion tunnel` の実行失敗
 > - WSL の `127.0.0.1` ループバックを VPN クライアントが hijack し SYN-SENT で固まる
 > - WSL 内 listener が Windows ブラウザから到達不可
@@ -339,6 +339,24 @@ az group delete -n "${RG_NAME}" --yes --no-wait
 | WSL から `az` 実行で Bastion tunnel が listen しない / `az login` がタイムアウト | **Microsoft 公式 Known Issue（VPN × WSL2）**。Microsoft Entra Global Secure Access / GlobalProtect / AnyConnect 等の VPN クライアントが Windows で動作していると、WSL2 NAT ネットワークが干渉を受けます。**公式推奨ワークアラウンドは Windows PowerShell から直接 `az` を実行すること**: `scripts/03-tunnel-ghes-mgmt.ps1` を使用してください。代替として `%USERPROFILE%\.wslconfig` に `[wsl2]` `dnsTunneling=false` を追加して `wsl --shutdown` でも改善します。 |
 | WSL2 内に `loopback0` 仮想 IF 出現・Bastion CLI が SYN-SENT で固まる | 上記 Known Issue の派生症状。GSA は WSL 内に priority 1 routing rule を注入し 127.0.0.0/8 を hijack します。`03-tunnel-ghes-mgmt.sh` は起動時に bypass rule (`from 127.0.0.0/8 to 127.0.0.0/8 lookup local priority 0`) を自動投入します（sudo 必要）。Windows PowerShell に切り替えれば不要です。 |
 | WSL から `az login` で `Failed to resolve 'login.microsoftonline.com'` | 同 VPN 干渉。`/etc/hosts` で `40.126.32.74 login.microsoftonline.com login.windows.net sts.windows.net` を強制マッピング、または `.wslconfig` の `dnsTunneling=false` を設定してください。 |
+| `https://localhost:8443` が `502/503/504` または `connection reset` を返す | GHES VM がデアロケート / 再起動中の可能性があります。`scripts/03-tunnel-ghes-mgmt.sh` / `.ps1` は起動時に **VM power state を自動チェック (preflight)** します。`--auto-start` (bash) / `-AutoStart` (ps) を付与すると停止中の VM を起動 → running 待機 → 90s warmup までスクリプトが面倒を見ます。 |
+
+### VM Preflight 機能（v2 以降）
+
+`03-tunnel-ghes-mgmt.{sh,ps1}` は tunnel を開く前に GHES VM の power state を `az vm get-instance-view` で取得し、状態に応じて挙動を分岐します。
+
+| 状態 | デフォルト挙動 | `--auto-start` / `-AutoStart` 付与時 |
+|---|---|---|
+| `running` | そのまま tunnel 開始 | 同左 |
+| `deallocated` / `stopped` | エラー終了 (exit 3) | `az vm start` → 最大 5 分待機 → 90 秒 GHES warmup → tunnel 開始 |
+| `starting` | 最大 5 分待機 → 90 秒 warmup → tunnel | 同左 |
+| 不明 / 取得失敗 | warning だけ出して継続 | 同左 |
+
+**スキップ方法**: `--skip-preflight` (bash) / `-SkipPreflight` (ps) または環境変数 `SKIP_PREFLIGHT=true`。Activity Log の確認や手動制御をしたい場合に有用。
+
+**用途**:
+- 「VM が知らないうちに止まっていた」現象（OS 再起動・自動メンテ・コスト削減で一時 deallocate していた等）からの自動復旧
+- Bastion tunnel は VM が deallocated でも一見成功する（接続は確立するが GHES プロセスが応答しない 502 を返す）ため、事前チェックの効果が大きい
 
 ### `.wslconfig` 推奨設定（VPN 干渉緩和）
 
