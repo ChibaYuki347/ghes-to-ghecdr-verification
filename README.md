@@ -136,10 +136,32 @@ az deployment sub list --query "[?name.starts_with(@,'ghestest-')] | [0].propert
 
 ## 5. 初期セットアップ
 
+> ⚠️ **VPN クライアントが Windows で稼働している場合の重要事項**
+>
+> Microsoft Entra Global Secure Access、GlobalProtect、Cisco AnyConnect 等の VPN クライアントが Windows で動作している環境では、WSL2 NAT ネットワークが VPN によって干渉を受け、以下のような症状が発生します（Microsoft 内部ガイド `Global Secure Access` でも Known Issue として明記）:
+> - WSL から `az login` / `az network bastion tunnel` の実行失敗
+> - WSL の `127.0.0.1` ループバックを VPN クライアントが hijack し SYN-SENT で固まる
+> - WSL 内 listener が Windows ブラウザから到達不可
+>
+> **公式推奨ワークアラウンド**: **Windows PowerShell から直接 `az` を実行する**（後述）。WSL 側の DNS をバイパスする `.wslconfig` 設定 ([トラブルシューティング §10](#10-トラブルシューティング)) との併用も可能です。
+
 ### 1. ターミナル A: Management Console tunnel を起動
+
+#### Linux / macOS / WSL (VPN なし)
 
 ```bash
 ./scripts/03-tunnel-ghes-mgmt.sh
+```
+
+#### Windows PowerShell (VPN あり / WSL ネットワーク不調時の推奨)
+
+```powershell
+# Azure CLI for Windows が必要: winget install Microsoft.AzureCLI
+az login
+.\scripts\03-tunnel-ghes-mgmt.ps1                 # Management Console: https://localhost:8443
+.\scripts\03-tunnel-ghes-mgmt.ps1 -Mode web       # Web UI:              https://<host>:8444
+.\scripts\03-tunnel-ghes-mgmt.ps1 -Mode ssh       # Git SSH:             ssh -p 2200
+.\scripts\03-tunnel-ghes-mgmt.ps1 -Mode adminshell # GHES admin shell:   ssh -p 2222
 ```
 
 既定では、ローカル `https://localhost:8443` が GHES Management Console (`:8443`) に tunnel されます。
@@ -314,8 +336,26 @@ az group delete -n "${RG_NAME}" --yes --no-wait
 | `https://localhost:8443` が応答なし | Bastion tunnel が確立しているか確認します。別端末から `curl -k https://localhost:8443` を実行してください。ポート競合の場合は `--port 18443` 等に変更します。 |
 | GitHub Connect が GHE.com に到達できない | Proxy VM の tinyproxy が動作しているか確認します: `sudo systemctl status tinyproxy` (Bastion 経由 SSH で実行)。 |
 | `installing-github-enterprise-server-on-azure` 公式手順との差分 | 公式手順は Public IP 前提・パスワードログイン前提です。本リポジトリは閉域 + 鍵認証に振っています。 |
-| WSL から `az` ログインしても `Bastion tunnel` が `8443` で listen しない / SYN-SENT のまま固まる | **Microsoft Entra Global Secure Access (GSA) Windows クライアント** が WSL2 内に `loopback0` 仮想 IF と routing rule (`priority 1: ipproto tcp lookup 127`) を追加し、127.0.0.1 ループバック全てを intercept しています。`03-tunnel-ghes-mgmt.sh` は起動時に自動で priority 0 の bypass rule (`from 127.0.0.0/8 to 127.0.0.0/8 lookup local`) を追加します（sudo が必要）。手動で適用する場合: `sudo ip rule add from 127.0.0.0/8 to 127.0.0.0/8 lookup local priority 0` |
-| `az login` 後に `Failed to resolve 'login.microsoftonline.com'` | 同じく GSA がパブリック MS auth エンドポイントを `6.6.0.x` private link に書き換えています。`/etc/hosts` で `40.126.32.74 login.microsoftonline.com login.windows.net sts.windows.net` 等を強制マッピングしてください。 |
+| WSL から `az` 実行で Bastion tunnel が listen しない / `az login` がタイムアウト | **Microsoft 公式 Known Issue（VPN × WSL2）**。Microsoft Entra Global Secure Access / GlobalProtect / AnyConnect 等の VPN クライアントが Windows で動作していると、WSL2 NAT ネットワークが干渉を受けます。**公式推奨ワークアラウンドは Windows PowerShell から直接 `az` を実行すること**: `scripts/03-tunnel-ghes-mgmt.ps1` を使用してください。代替として `%USERPROFILE%\.wslconfig` に `[wsl2]` `dnsTunneling=false` を追加して `wsl --shutdown` でも改善します。 |
+| WSL2 内に `loopback0` 仮想 IF 出現・Bastion CLI が SYN-SENT で固まる | 上記 Known Issue の派生症状。GSA は WSL 内に priority 1 routing rule を注入し 127.0.0.0/8 を hijack します。`03-tunnel-ghes-mgmt.sh` は起動時に bypass rule (`from 127.0.0.0/8 to 127.0.0.0/8 lookup local priority 0`) を自動投入します（sudo 必要）。Windows PowerShell に切り替えれば不要です。 |
+| WSL から `az login` で `Failed to resolve 'login.microsoftonline.com'` | 同 VPN 干渉。`/etc/hosts` で `40.126.32.74 login.microsoftonline.com login.windows.net sts.windows.net` を強制マッピング、または `.wslconfig` の `dnsTunneling=false` を設定してください。 |
+
+### `.wslconfig` 推奨設定（VPN 干渉緩和）
+
+Windows ホストの `%USERPROFILE%\.wslconfig` に以下を追加し、`wsl --shutdown` で WSL を再起動してください:
+
+```ini
+[wsl2]
+dnsTunneling=false
+networkingMode=mirrored
+firewall=false
+```
+
+- `dnsTunneling=false`: WSL の DNS 解決を Windows VPN 経路から切り離す
+- `networkingMode=mirrored`: Windows と WSL のネットワーク (loopback / 127.0.0.1) を共有
+- `firewall=false`: Windows Defender Firewall の WSL 強制を無効化
+
+> なお `networkingMode=mirrored` を有効にしても VPN 側で WSL traffic を hijack する設定が enforce されている場合、根本対処は **Windows PowerShell から直接 `az` を実行する** (`03-tunnel-ghes-mgmt.ps1`) です。
 
 ## 11. 関連ファイル
 
@@ -334,7 +374,8 @@ ghes-to-ghecdr/
 ├── scripts/
 │   ├── 01-generate-ssh-key.sh
 │   ├── 02-deploy.sh
-│   ├── 03-tunnel-ghes-mgmt.sh
+│   ├── 03-tunnel-ghes-mgmt.sh      # Linux / macOS / WSL (VPN なし環境向け)
+│   ├── 03-tunnel-ghes-mgmt.ps1     # Windows PowerShell (VPN あり環境向け、推奨)
 │   ├── 04-generate-self-signed-cert.sh
 │   └── 05-setup-public-dns.sh
 ├── docs/
