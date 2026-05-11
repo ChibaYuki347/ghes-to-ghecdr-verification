@@ -129,8 +129,52 @@ GHES → GHE.com Connect の場合:
 | `github.com` | GHES standard connect (GitHub.com 接続を維持する場合) | HTTPS 443 |
 | `api.github.com` | 〃 | HTTPS 443 |
 | `uploads.github.com` | 〃 | HTTPS 443 |
+| `github.com/enterprises/oauth_callback` | **Azure Subscription 連携時のみ一時的に必須** (§4.2.1 参照) | HTTPS 443 |
 
 > ⚠️ GHES が **GitHub Connect で GHE.com に向ける場合**、デフォルトで GitHub.com への接続も期待されるため、両方の hostname を allow-list する。GHE.com 専用化する場合は `ghe-config app.github.github-connect-ghe-com-enabled true` を設定する（後述）。
+
+#### 4.2.1 Azure Subscription 連携時の OAuth callback URL フォールバック ⚠️
+
+Metered Billing の課金経路として **Azure Subscription** を `<TENANT>.ghe.com` の Enterprise に連携 / 更新する際、OAuth 認可フローは下記のように **public github.com を経由** します:
+
+```
+[Client browser]
+     │
+     │ ① 連携開始
+     ▼
+<TENANT>.ghe.com (Enterprise → Settings → Billing → Connect Azure subscription)
+     │
+     │ ② Azure サインインへ
+     ▼
+login.microsoftonline.com (Azure AD 認証)
+     │
+     │ ③ OAuth callback (★ ここで public github.com を経由する)
+     ▼
+https://github.com/enterprises/oauth_callback?code=...   ←【egress allow 必須】
+     │
+     │ ④ 課金 binding 完了後、tenant へ戻る
+     ▼
+<TENANT>.ghe.com
+```
+
+このため、**Azure Subscription を連携する瞬間および更新する瞬間に限り**、egress proxy / firewall で以下の URL を **クエリパラメータを含めて** 許可する必要があります:
+
+| URL | 用途 | タイミング |
+|---|---|---|
+| `https://github.com/enterprises/oauth_callback` | Azure subscription 連携 OAuth callback | **連携時 / 更新時のみ**、subscription ID が persist された後は閉じてよい |
+
+**実運用での設計指針**:
+
+- **永続的 allow** (推奨): 規約上問題なければ `github.com` 配下を恒久的に open にしておく。連携作業の都度 firewall 変更を申請するより運用ミスが少ない
+- **時限的 allow**: コンプライアンス要件が厳しく `github.com` を全閉している場合、**連携 / 更新作業の窓口時間だけ** `https://github.com/enterprises/oauth_callback` (+ クエリ全て) を許可するチェンジを入れて作業する
+- **クエリパラメータの扱い**: OAuth code は `?code=...&state=...` 形式で渡されるため、proxy/firewall ルールは **path 完全一致 + クエリ任意** で許可する。HTTP URL pattern を厳格にマッチングする WAF/CASB を使っている場合、想定外にブロックされて UI 上「Azure に連携できません」と出る原因になる
+
+**典型的な失敗ケース**:
+
+- proxy では `github.com` を許可しているが、**WAF / CASB が `/enterprises/oauth_callback` を「未知のエンドポイント」として block** → Azure 認可後 GHE.com 画面に戻れず、Billing 画面で「Azure subscription not connected」のまま
+- `<TENANT>.ghe.com` だけを allow-list して `github.com` を全閉 → OAuth callback が proxy で 403 → 同上
+
+> 📌 出典: [Network details for GHE.com – OAuth callback URL for connecting an Azure subscription for billing](https://docs.github.com/en/enterprise-cloud@latest/admin/data-residency/network-details-for-ghecom#oauth-callback-url-for-connecting-an-azure-subscription-for-billing)
 
 ### 4.3 GHES Management Console のプロキシ設定
 
@@ -171,11 +215,23 @@ GitHub Connect (GHE.com 向け) を確立する前に、以下の条件を満た
 
 | 項目 | 要件 | 備考 |
 |---|---|---|
-| GHES バージョン | **3.12 以上** | GHE.com 向け Connect は 3.12 から GA |
-| GHE.com tenant の billing | **Invoiced** (請求書払い) が公式要件 | Credit Card / Free Trial 上の tenant では `Enable GitHub Connect` 後の handshake が完了しない可能性あり。Azure Marketplace 経由の MCA も「invoiced」と見なされる |
+| GHES バージョン | **下表 (5.1.1) 参照** | Metered Billing / GHAS の販売可否は GHES バージョン依存 |
+| GHE.com tenant の billing | **Invoiced** (請求書払い) が公式要件 | Credit Card / Free Trial 上の tenant では `Enable GitHub Connect` 後の handshake が完了しない可能性あり。Azure Marketplace 経由の MCA / Azure Subscription 連携も「invoiced」と見なされる |
 | GHES 側に enterprise が作成済み | ✅ | 初期 setup 時に enterprise account を作成 |
 | GHE.com tenant 側で **Site admin** ロール | ✅ | 接続承認のために必要 |
 | outbound HTTP proxy で以下の FQDN を許可 | 下表参照 | GHES と proxy VM の両方から到達できること |
+
+#### 5.1.1 GHES バージョン要件 (License Sync / GHAS Metered 販売)
+
+GitHub Connect 自体は GHES 3.12 で GA ですが、**Metered Billing 経由での GHAS / 機能販売には別途バージョン要件があり**、Sales 側からの正式案内では下記が最新の閾値です（docs 上の表記は GA 履歴ベースで古い場合があります）:
+
+| 販売モデル | 必要 GHES バージョン | 備考 |
+|---|---|---|
+| GitHub Advanced Security **bundle** を Metered で販売 | **GHES 3.14 以上** | GHAS をひとまとめの bundle SKU として Metered で販売する場合 |
+| GitHub Advanced Security **split SKU** (Code Security / Secret Protection 個別) を Metered で販売 | **GHES 3.17 以上** | 2024 後半以降の split SKU 体系 (Code Security / Secret Protection を別 SKU で販売) を使う場合 |
+| いずれの場合も共通 | 上記に加えて **GHES instance 自体が GHE.com に "entered" している** こと | = §5.2〜5.5 の GitHub Connect handshake が完了し、GHE.com 側 Enterprise の「Connected servers」一覧に当該 GHES が登録されている状態 |
+
+> ⚠️ **公式 docs (`docs.github.com`) には GitHub Connect 自体の最低バージョンとして 3.12 が記載** されているが、**Metered Billing 経由で GHAS を販売する**には上記により高いバージョンが必要。営業段階でクロージング前にバージョン要件を必ず確認すること。本リポジトリの lab は **3.18.8** で構築しており、いずれの販売モデルでも要件を満たす。
 
 **proxy で許可必須の FQDN (GHE.com 接続時):**
 
@@ -615,6 +671,20 @@ GHE.com Metered Billing では:
 - **Active User** = 過去 30 日でログイン or API call があったユーザー
 - 月次 invoice (Azure Subscription 連携 or Credit Card)
 - **Cost Center** 機能で部門別 chargeback が可能
+
+### 10.4 Azure Subscription 連携の egress 要件 (再掲)
+
+Azure Subscription を Metered Billing の課金経路として連携する場合、OAuth 認可フローが **public `github.com` を経由** します。閉域構成のまま連携を実施する際は、**§4.2.1** で記載した **`https://github.com/enterprises/oauth_callback` を含む allow-list の一時開放**が必要です。
+
+連携作業フロー（実運用）:
+
+1. 連携作業の **作業窓口時間** を設定し、その間だけ proxy / firewall で `github.com/enterprises/oauth_callback?*` を許可
+2. `<TENANT>.ghe.com` Enterprise → Settings → Billing → **Connect Azure subscription** を実行
+3. Azure サインイン → 対象 Subscription を選択 → callback で `<TENANT>.ghe.com` に戻ることを確認
+4. Subscription ID が GHE.com Billing 画面に表示されたら連携成功
+5. 連携完了後は allow-list を元に戻してよい（次回 **Subscription を変更 / 更新する際は再度 allow-list を開く**）
+
+> ⚠️ **GHAS の Metered 販売モデル別 GHES バージョン要件** は §5.1.1 を参照。GHAS bundle は GHES 3.14+、split SKU (Code Security / Secret Protection 個別) は GHES 3.17+ が必要で、いずれも GHES instance 自体が GHE.com 側に "entered" している（= §5 の Connect handshake 完了）ことが前提となります。
 
 ---
 
