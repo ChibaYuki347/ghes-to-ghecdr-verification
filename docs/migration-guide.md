@@ -163,9 +163,53 @@ GitHub Connect により以下が共有可能になる:
 | Dependabot updates / advisory database | ✅ | ✅ |
 | GitHub Actions from GitHub.com Marketplace | ✅ | ❌ (GHE.com の場合は限定) |
 
-### 5.1 GHE.com 専用接続を有効化
+> 💡 **本セクションは実機検証済み** — 本リポジトリで構築した Azure 上の閉域 GHES 3.18.8 から `<TENANT>.ghe.com` への接続を実際に成立させた結果を反映しています。最後の `### 5.6 実機検証で観測された挙動と注意点` で具体的な落とし穴を共有しています。
 
-GHES の admin shell に SSH:
+### 5.1 前提条件と outbound 通信要件
+
+GitHub Connect (GHE.com 向け) を確立する前に、以下の条件を満たす必要があります:
+
+| 項目 | 要件 | 備考 |
+|---|---|---|
+| GHES バージョン | **3.12 以上** | GHE.com 向け Connect は 3.12 から GA |
+| GHE.com tenant の billing | **Invoiced** (請求書払い) が公式要件 | Credit Card / Free Trial 上の tenant では `Enable GitHub Connect` 後の handshake が完了しない可能性あり。Azure Marketplace 経由の MCA も「invoiced」と見なされる |
+| GHES 側に enterprise が作成済み | ✅ | 初期 setup 時に enterprise account を作成 |
+| GHE.com tenant 側で **Site admin** ロール | ✅ | 接続承認のために必要 |
+| outbound HTTP proxy で以下の FQDN を許可 | 下表参照 | GHES と proxy VM の両方から到達できること |
+
+**proxy で許可必須の FQDN (GHE.com 接続時):**
+
+| FQDN | 用途 |
+|---|---|
+| `<TENANT>.ghe.com` | tenant の Web UI / OAuth |
+| `api.<TENANT>.ghe.com` | REST API |
+| `uploads.<TENANT>.ghe.com` | LFS / リリース成果物 |
+| `objects-origin.<TENANT>.ghe.com` | git objects 取得 (Connect 後の OAuth callback も含む) |
+| `auth.ghe.com` | OIDC 認証 |
+| `github.com` | OAuth App 経由のフォールバック |
+| `*.actions.githubusercontent.com` | Actions runner 連携 (使う場合のみ) |
+
+検証コマンド (GHES admin shell からも実行可能):
+
+```bash
+# proxy 経由で各 FQDN へ到達確認 (302 or 401 ならば OK)
+for host in <TENANT>.ghe.com api.<TENANT>.ghe.com uploads.<TENANT>.ghe.com auth.ghe.com github.com; do
+  echo -n "$host: "; curl -sS -o /dev/null -w "%{http_code}\n" \
+    -x http://<PROXY_PRIVATE_IP>:8888 https://$host/
+done
+```
+
+### 5.2 GHES Management Console で HTTP proxy を設定
+
+GitHub Connect の通信は GHES プロセス本体から発生するため、Mgmt Console (`:8443`) の **HTTP proxy** 設定が必須です（NSG 経由の OS レベル proxy だけでは不十分）。
+
+1. `https://<ghes-host>:8443/setup/settings` を開く
+2. **Privacy** タブ
+3. **HTTP proxy server** に `http://<PROXY_PRIVATE_IP>:8888` を入力
+4. **Save settings** → reconfigure が走り 5〜10 分かかる
+5. 反映後、admin shell で `ghe-config core.http-proxy` の値が persist されていることを確認
+
+### 5.3 GHE.com 専用接続を有効化 (admin shell)
 
 ```bash
 ssh -p 122 admin@<ghes-host>
@@ -178,27 +222,98 @@ ghe-config app.github.github-connect-ghe-com-subdomain "<TENANT>"
 ghe-config-apply
 ```
 
-### 5.2 GUI で接続
+> ⚠️ `<TENANT>` は GHE.com の **subdomain そのもの**（例: tenant の URL が `https://octocorp.ghe.com` なら `octocorp`）。GHES 側の enterprise slug と一致しない場合がある（実機検証では GHES 側 `yuki-chiba-dr-inc` / GHE.com subdomain `yuki-chiba-drinc` のように slugify 規則が異なった）。
+
+`ghe-config-apply` は約 5 分かかります（Phase 1〜4 で 4 段階のシステム検証）。
+
+### 5.4 GUI で接続承認
 
 1. GHES の右上アバター → **Enterprise settings**
-2. 左サイドバー **GitHub Connect**
-3. **Enable GitHub Connect** をクリック
-4. GHE.com 側に存在する enterprise account を **Connect**
-5. 機能ごとに enable/disable を選択
+2. URL は `https://<ghes-host>/enterprises/<ENTERPRISE_SLUG>/settings/dotcom_connection` （`<ENTERPRISE_SLUG>` は GHES 側で表示名から slugify されたもの）
+3. **Enable GitHub Connect** をクリック → GHE.com にリダイレクト
+4. GHE.com 側で IdP 認証 → OAuth callback
+5. tenant 側に存在する enterprise account を選択 → **Connect** をクリック
+6. 機能ごとの toggle（License sync / Dependabot / 等）を選択して保存
 
-### 5.3 接続後の確認
+### 5.5 接続後の確認
 
-GHES の admin shell から:
+**GHES 側の admin shell** から:
 
 ```bash
+# enabled / subdomain の確認のみ (OAuth トークン等は Rails DB に保存され ghe-config には現れない)
+ghe-config --get-regexp 'github-connect'
+# → app.github.github-connect-ghe-com-enabled true
+# → app.github.github-connect-ghe-com-subdomain <TENANT>
+
+# システム全体の健全性
 ghe-config-check
 ghe-cluster-status -v
 ```
+
+**GHE.com tenant 側** (UI) で確認:
+
+1. `https://<TENANT>.ghe.com` にログイン
+2. tenant の Enterprise settings → **GitHub Connect** タブ
+3. **N SERVER CONNECTED** と表示され、`HOSTNAME` 欄に GHES の FQDN が出ていれば成立
 
 License Sync の動作:
 
 - GHE.com 側で **Settings → Billing → Active Users** に GHES の active user 数が反映される（数時間〜1 日のラグあり）
 - これにより **Volume License + Metered Billing の重複課金を回避** できる
+
+### 5.6 実機検証で観測された挙動と注意点
+
+本リポジトリの Azure GHES (`ghes-lab.chiba-yuki.com`) から GHE.com tenant への Connect を実際に確立した際に観測された挙動を整理しています。
+
+#### (1) Enterprise slug の表記揺れ — handshake 自体には影響しないが URL 直打ちで罠
+
+| 場所 | 例 |
+|---|---|
+| GHES の enterprise display name | `yuki-chiba-dr.inc`（ドット入り） |
+| GHES の URL 上の slug | `yuki-chiba-dr-inc`（ドット→ハイフン） |
+| GHE.com の subdomain | `yuki-chiba-drinc`（ドット削除） |
+
+**示唆**: `ghe-config app.github.github-connect-ghe-com-subdomain` には **GHE.com の subdomain そのまま**を渡すこと。enterprise slug ではない。
+
+#### (2) handshake は 2 段階 — haproxy log に出る順序
+
+GHES の `/var/log/haproxy.log` に以下のように 2 つの POST が記録される:
+
+```
+POST /enterprises/<slug>/settings/dotcom_connection                 → 302 (Enable GitHub Connect 押下)
+POST /enterprises/<slug>/settings/dotcom_connection/resume_dotcom_connection → 302 (OAuth callback 受信)
+```
+
+両方が 302 を返していれば handshake は成功している。
+
+#### (3) ブラウザ Console の `form-action` CSP エラーは無視してよい
+
+OAuth callback ページ (`https://<TENANT>.ghe.com/auth/oidc/callback`) で、`<form action="/enterprises/<TENANT>/enterprise_installations?...">` への自動 submit が下記の CSP エラーを表示することがある:
+
+```
+Sending form data to '<URL>' violates the following Content Security Policy directive: 
+"form-action 'self' ghe.com copilot-workspace.githubnext.com objects-origin.<TENANT>.ghe.com".
+The request has been blocked.
+```
+
+**実際には接続は成立する** ことを確認済み（GHE.com 側 GitHub Connect 画面に `1 SERVER CONNECTED` が表示される）。本エラーは Chrome の `form-action` CSP と `'self'` keyword + redirect chain 判定の挙動差分による擬陽性で、handshake のサーバ間通信自体は別経路（fetch ベース）で完了している。
+
+> ⚠️ ただし、長時間「Signed in with <TENANT>」画面で停止し続ける場合は、ブラウザを再読み込みするか、GHES 側 Connect 設定画面に直接戻って状態を確認すること。
+
+#### (4) `ghe-config` には接続成立後も認証情報が現れない
+
+接続が確立しても、`ghe-config --get-regexp 'github-connect'` には以下の **2 行のみ** しか出ない:
+
+```
+app.github.github-connect-ghe-com-enabled true
+app.github.github-connect-ghe-com-subdomain <TENANT>
+```
+
+GitHub App credentials / installation token は Rails DB（MySQL）の `dotcom_connection_settings` 等のテーブルに保存される設計のため。**接続状態の確認は必ず Web UI 側（GHES / GHE.com 双方）で行う** こと。
+
+#### (5) Member count は別途追加が必要
+
+接続直後は GHE.com 側 GitHub Connect 画面で `0 members` と表示される。これは normal で、GHES の users が GHE.com 上の Members に紐づけられるのは **License sync 連携を ON にして数時間〜1 日経過後** となる。次節 (Section 6) の移行戦略で User mapping 設計を進めること。
 
 ---
 
@@ -479,9 +594,9 @@ GHE.com Metered Billing では:
 lab で検証できるシナリオ:
 - ✅ 閉域 GHES の初期構築・TLS 設定
 - ✅ proxy 経由の outbound 通信
-- ⬜ GitHub Connect (GHES → GHE.com) の有効化（要動作確認）
+- ✅ **GitHub Connect (GHES → GHE.com) の有効化** — 本リポジトリで実機検証済（Section 5.6 参照）
 - ⬜ GEI で test repo を GHE.com に移行（要動作確認）
-- ⬜ License Sync の動作確認
+- ⬜ License Sync の動作確認（ユーザー側 reflect まで数時間〜1 日）
 
 ---
 
