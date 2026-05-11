@@ -22,6 +22,7 @@ GHES 3.18.8 を Azure の閉域ネットワークに構築し、GHE.com (Data Re
 
 ### 関連ドキュメント
 
+- **顧客向け移行ガイド**: [`docs/migration-guide.md`](docs/migration-guide.md) — GHES (Volume License) → GHE.com Data Residency (Metered Billing) への段階移行ガイド (Japanese)
 - 事前調査: [`docs/research/migration-paths.md`](docs/research/migration-paths.md) — GHES→GHE.com Data Residency 移行パス調査
 - アーキテクチャレビュー: [`docs/research/design-review.md`](docs/research/design-review.md) — AVM/WAF 観点の advisory
 - GitHub Docs: [Installing GitHub Enterprise Server on Azure](https://docs.github.com/en/enterprise-server@3.15/admin/installing-your-enterprise-server/setting-up-a-github-enterprise-server-instance/installing-github-enterprise-server-on-azure)
