@@ -286,9 +286,23 @@ POST /enterprises/<slug>/settings/dotcom_connection/resume_dotcom_connection →
 
 両方が 302 を返していれば handshake は成功している。
 
-#### (3) ブラウザ Console の `form-action` CSP エラーは無視してよい
+#### (3) ⚠️ ブラウザ Console の `form-action` CSP エラーは **本物のブロッカー** — Chrome では handshake が完走しない
 
-OAuth callback ページ (`https://<TENANT>.ghe.com/auth/oidc/callback`) で、`<form action="/enterprises/<TENANT>/enterprise_installations?...">` への自動 submit が下記の CSP エラーを表示することがある:
+> **重大**: 本リポジトリの当初検証で「擬陽性」と誤判定し公開ガイドへも記載しましたが、**追加検証で本物のブロッカーであることが判明** したため記述を訂正しています。
+
+OAuth callback ページ (`https://<TENANT>.ghe.com/auth/oidc/callback`) は最後に下記の form を自動 submit する:
+
+```html
+<form action="https://<TENANT>.ghe.com/enterprises/<TENANT>/enterprise_installations?state=...&token=..." method="post">
+```
+
+このページの CSP には:
+
+```
+form-action 'self' ghe.com copilot-workspace.githubnext.com objects-origin.<TENANT>.ghe.com;
+```
+
+**Chrome の `form-action` CSP は redirect chain 全体に対して評価される** ため、`enterprise_installations` POST → 302 → GHES (`<ghes-host>/admin/dotcom_connection/change_complete?...`) という最終 hop で allow-list 外と判定されブロックされる。Console にも下記の通り出る:
 
 ```
 Sending form data to '<URL>' violates the following Content Security Policy directive: 
@@ -296,11 +310,66 @@ Sending form data to '<URL>' violates the following Content Security Policy dire
 The request has been blocked.
 ```
 
-**実際には接続は成立する** ことを確認済み（GHE.com 側 GitHub Connect 画面に `1 SERVER CONNECTED` が表示される）。本エラーは Chrome の `form-action` CSP と `'self'` keyword + redirect chain 判定の挙動差分による擬陽性で、handshake のサーバ間通信自体は別経路（fetch ベース）で完了している。
+実機での観測症状:
+- GHES 側「Enable GitHub Connect」を Chrome から実行 → OIDC 認証画面 → 「Signed in with <TENANT>」画面で停止
+- callback (`/admin/dotcom_connection/change_complete`) が production.log に記録されず ＝ GHES 側はそもそも callback を受け取っていない
+- GHE.com 側に **orphan な `enterprise_installation` レコードのみ** 作成され、UI 上は `N SERVER CONNECTED` と紛らわしく表示される（実態は未接続）
+- GHES の resque ジョブ `EnterpriseAdvisoryDatabaseSyncJob` などが毎時実行されるたび `"Connection settings missing, skipping sync with github.com"` を resqued.log に出力
 
-> ⚠️ ただし、長時間「Signed in with <TENANT>」画面で停止し続ける場合は、ブラウザを再読み込みするか、GHES 側 Connect 設定画面に直接戻って状態を確認すること。
+**回避策**: handshake は **Microsoft Edge / Firefox から実行** する。両者で redirect chain における CSP `form-action` 評価が緩く、callback が GHES に正常着地することを確認済み。Chrome を使い続けたい場合は [Disable Content-Security-Policy 拡張](https://chromewebstore.google.com/detail/disable-content-security/ieelmcmcagommplceebfedjlakkhpden) で **回避可能だが推奨しない**（別の通信もブロック解除されるため一時的にのみ）。
 
-#### (4) `ghe-config` には接続成立後も認証情報が現れない
+#### (4) handshake の URL フロー — 「5 分タイマー」と orphan record の扱い
+
+GHES 側「Enable GitHub Connect」をクリックすると以下のフローが走る:
+
+```
+GHES UI                                                       GHE.com
+  │ POST /enterprises/<GHES_SLUG>/settings/dotcom_connection
+  ├──────────────────────────────────────────────────────────────►
+  │                                              GHE.com 側で
+  │                                              enterprise_installation
+  │                                              record 作成 (timer 5 min)
+  │ 302 → https://<TENANT>.ghe.com/enterprise_installations/new
+  │◄──────────────────────────────────────────────────────────────
+  │
+  │ (browser navigate)
+  │──────────────────────────────────────────────────────────────►
+  │                                              IdP/OIDC 認証
+  │                                              認可 form 表示
+  │                                              form auto-submit:
+  │                                              POST /enterprise_installations
+  │                                              → 302 → /admin/dotcom_connection/
+  │                                                       change_complete
+  │ GET /admin/dotcom_connection/change_complete?state=...
+  │◄──────────────────────────────────────────────────────────────
+  │ (ここで GHES 側に Connect record 作成 = 完了)
+  │
+  │ 302 → /enterprises/<GHES_SLUG>/settings/dotcom_connection
+  ↓
+  (toggle 画面に切り替わる)
+```
+
+**5 分タイマー**: GHE.com 側で `enterprise_installation` レコードが作成されてから **5 分以内** に callback (`change_complete`) が着信しないと expire し、UI が下記表示に変わる:
+
+```
+GitHub Connect is not enabled yet
+You have not completed the setup process on the <TENANT>.ghe.com side. 
+Please do so within 5 minutes from now. After this time, you will have to reinitiate the setup process.
+
+[Complete your GitHub Connect setup]
+```
+
+**orphan record の削除**: CSP エラーで callback が届かなかった場合、GHE.com 側にだけレコードが残る。再 handshake を試みると GHE.com 側「Select an enterprise」画面で:
+
+```
+A connection for <GHES_HOSTNAME> already exists.
+Please disconnect the existing instance and try again. 
+If the instance no longer exists, you can remove it from known installations.
+```
+
+と表示される。「**remove it from known installations**」リンクから orphan を削除してから再試行する。
+
+#### (5) `ghe-config` には接続成立後も認証情報が現れない
 
 接続が確立しても、`ghe-config --get-regexp 'github-connect'` には以下の **2 行のみ** しか出ない:
 
@@ -309,11 +378,49 @@ app.github.github-connect-ghe-com-enabled true
 app.github.github-connect-ghe-com-subdomain <TENANT>
 ```
 
-GitHub App credentials / installation token は Rails DB（MySQL）の `dotcom_connection_settings` 等のテーブルに保存される設計のため。**接続状態の確認は必ず Web UI 側（GHES / GHE.com 双方）で行う** こと。
+GitHub App credentials / installation token は Rails DB（MySQL）に保存される設計のため。**接続状態の最終確認は必ず以下のいずれかで行う** こと:
 
-#### (5) Member count は別途追加が必要
+- GHES UI: `/enterprises/<GHES_SLUG>/settings/dotcom_connection` ページに **機能ごとの toggle 一覧** （Server statistics / License sync / Advisory database / Dependabot 等）が表示されれば成立
+- GHE.com UI: `1 SERVER CONNECTED` 表示**だけでは不十分**（orphan record でも同じ表示）。下記の resqued.log と合わせて判定する
+- GHES admin shell: `sudo tail /var/log/github/resqued.log | grep -i "Connection settings missing"` が出続けていれば未接続、`Starting Advisory Database sync with github.com` の後に skip メッセージが出なくなれば接続完了
+
+#### (6) 接続完了後、各機能の toggle を ON にする必要がある
+
+接続成立 ≠ License sync 自動開始。GHES の `/enterprises/<GHES_SLUG>/settings/dotcom_connection` に表示される各 toggle (Server statistics / License sync / Advisory database 更新 / Dependabot updates 等) を **個別に ON** にして初めてその機能の sync ジョブが GitHub.com / GHE.com 側へ outbound を行う。
+
+#### (7) sync スケジュール — 即時反映ではない
+
+| ジョブ | 動作間隔 | 用途 |
+|---|---|---|
+| `EnterpriseAdvisoryDatabaseSyncJob` | 1 時間ごと | 脆弱性 advisory DB の更新 |
+| Server usage / License sync | **24 時間ごと**（GHES 仕様）| GHE.com の Billing → Active Users に反映 |
+
+= **GHE.com 側 GitHub Connect 画面に「Server usage never synced」と出ていても、enable 直後〜24h 以内なら正常**。次節 (5.7) のトラブルシューティングで「24h 経過後も synced されない」場合の切り分け手順を記載。
+
+#### (8) Member count は別途追加が必要
 
 接続直後は GHE.com 側 GitHub Connect 画面で `0 members` と表示される。これは normal で、GHES の users が GHE.com 上の Members に紐づけられるのは **License sync 連携を ON にして数時間〜1 日経過後** となる。次節 (Section 6) の移行戦略で User mapping 設計を進めること。
+
+### 5.7 トラブルシューティング: "Server usage never synced" が出続ける場合
+
+GHE.com の GitHub Connect 画面に下記が表示され続ける症状:
+
+```
+ghes-lab.chiba-yuki.com - GitHub Connect server usage never synced
+```
+
+切り分け順序:
+
+1. **接続完了から 24 時間経過しているか？** ← 経過していないなら正常。待つ
+2. **GHES UI 側で接続状態が正しいか？** — `/enterprises/<GHES_SLUG>/settings/dotcom_connection` で feature toggle 一覧が表示されているか
+   - もし「Enable GitHub Connect」ボタンや「Complete your setup」が出ているなら **GHES 側の handshake 未完了**。§5.6 (3)(4) を参照して再 handshake
+3. **GHES resqued.log で skip メッセージが出ていないか?**
+   ```bash
+   sudo tail -200 /var/log/github/resqued.log | grep -iE 'Connection settings missing|sync with github.com'
+   ```
+   - `Connection settings missing, skipping sync with github.com` が続いている → 接続未完了。再 handshake 必要
+4. **対象機能 (Server statistics / License usage) の toggle が ON か？** — GHES 設定画面で確認
+5. **outbound proxy が GHE.com / api.github.com に通っているか？** — §5.1 のコマンドで確認
 
 ---
 
